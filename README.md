@@ -1,13 +1,13 @@
-# Oracle Database 19c Data Guard --- Production DR Exercise
+# Oracle Database 19c Data Guard — Production-Grade DR Exercise
 
-Hands-on Oracle Database 19c Data Guard engineering project built around
-an eight-part Data Guard implementation and implemented on AWS.
+Production-grade Oracle Database 19c Data Guard engineering exercise implemented on AWS,
+covering physical standby construction, redo transport, controlled role transitions,
+disaster failover, standby recovery, reinstate/rebuild, and final DR validation.
 
-The project follows the implementation in sequence while turning each engineering step
-into a practical DBA engineering task. The end goal is not simply to
-create a standby database, but to demonstrate the complete
-disaster-recovery lifecycle: build, replicate, validate, fail over,
-recover, reinstate, and perform a planned switchover.
+The project follows a controlled engineering lifecycle. The goal is not simply to
+create a standby database, but to demonstrate the complete disaster-recovery lifecycle:
+build, replicate, validate, perform controlled role transitions, fail over, recover,
+reinstate, switch back, and validate again.
 
 > **A standby database that has never been tested does not prove
 > disaster-recovery readiness.**
@@ -26,8 +26,8 @@ Demonstrate that an Oracle Database 19c environment can:
 8.  Perform a planned switchover.
 9.  Return to a healthy Data Guard configuration.
 
-This project is designed as a **production-grade DR exercise performed
-in a controlled lab environment**.
+This project is designed as a **production-grade DR exercise executed in a controlled
+AWS environment**.
 
 ------------------------------------------------------------------------
 
@@ -42,7 +42,7 @@ Phase 1 — Oracle Platform Build & Baseline
        ↓
 Phase 2 — RMAN Backup & Recovery Configuration
        ↓
-Phase 3 — Oracle 19c July 2026 Release Update Patching
+Phase 3 — Oracle 19c Release Update Patching
        ↓
 Phase 4 — Data Guard Architecture & DR Design
        ↓
@@ -56,13 +56,13 @@ Phase 8 — Redo Transport & Apply Validation
        ↓
 Phase 9 — Client Connectivity & Service Validation
        ↓
-Phase 10 — Data Guard Broker
+Phase 10 — Planned Switchover & Snapshot Standby
        ↓
-Phase 11 — Planned Switchover & Snapshot Standby
+Phase 11 — Disaster Failover & Active Data Guard
        ↓
-Phase 12 — Disaster Failover & Active Data Guard
+Phase 12 — Reinstate / Rebuild Former Primary
        ↓
-Phase 13 — Reinstate / Rebuild Former Primary
+Phase 13 — Data Guard Broker & DR Operations
        ↓
 Phase 14 — Final DR Validation & Recovery Evidence
 ```
@@ -204,11 +204,11 @@ Document:
 
 ---
 
-# Phase 3 — Oracle 19c July 2026 Release Update Patching
+# Phase 3 — Oracle 19c Release Update Patching
 
 ## Objective
 
-Patch DB01 and DB02 to the same Oracle Database 19c July 2026 Release Update level before establishing the final Data Guard configuration.
+Patch DB01 and DB02 to the same supported Oracle Database 19c Release Update level before establishing the final Data Guard configuration.
 
 ## Patch Strategy
 
@@ -369,29 +369,216 @@ Passwords and secrets are never stored in this repository.
 
 ## Objective
 
-Build DB02 as a physical standby using RMAN Active Database Duplication.
+Build DB02 as a physical standby using the appropriate RMAN seeding method for the
+size and operational requirements of the database.
 
-## RMAN
+## Current Project — Active Database Duplication
 
-``` text
+The current project uses RMAN Active Database Duplication because the database is
+small enough for direct network-based duplication and the environment is designed to
+demonstrate the complete Data Guard build.
+
+```text
 DUPLICATE TARGET DATABASE
 FOR STANDBY
 FROM ACTIVE DATABASE
 DORECOVER
 ```
 
+This method copies the primary database over the network while the primary remains
+available. It is practical for small-to-moderate databases when network throughput,
+backup infrastructure, and primary workload permit it.
+
+## Large Database Strategy — Backup-Based Standby Construction
+
+For a very large production database, such as a **4 TB database**, the preferred
+approach is to use **RMAN backup-based duplication** and pre-stage/copy the backup
+files to the standby or shared backup storage. This avoids making the initial 4 TB
+seed a live network copy from the primary and gives the DBA more control over
+throughput, restartability, backup retention, and primary workload.
+
+### Large Database Workflow
+
+```text
+PRIMARY
+   │
+   ├── RMAN Level 0 / full backup
+   ├── RMAN archived redo backups
+   ├── Standby control file / control file backup
+   │
+   ▼
+BACKUP STORAGE
+   │
+   ├── Copy / stage backup pieces
+   │
+   ▼
+STANDBY
+   │
+   ├── Catalog backup pieces
+   ├── RMAN restore / duplicate
+   ├── Apply archived redo
+   └── Start managed recovery
+```
+
+### 4 TB Standby Build Steps
+
+**1. Prepare standby storage**
+
+Provision enough storage for the 4 TB database plus control files, online/standby
+redo logs, FRA, temporary restore space, and operational headroom.
+
+**2. Generate a seed backup on the primary**
+
+Use RMAN parallelism and multisection backups where appropriate for the storage and
+CPU available:
+
+```rman
+RUN {
+  ALLOCATE CHANNEL c1 DEVICE TYPE DISK;
+  ALLOCATE CHANNEL c2 DEVICE TYPE DISK;
+  ALLOCATE CHANNEL c3 DEVICE TYPE DISK;
+  ALLOCATE CHANNEL c4 DEVICE TYPE DISK;
+
+  BACKUP AS COMPRESSED BACKUPSET
+    DATABASE
+    SECTION SIZE 16G
+    FORMAT '/backup/dg_seed/%U';
+
+  BACKUP AS COMPRESSED BACKUPSET
+    ARCHIVELOG ALL
+    FORMAT '/backup/dg_seed/%U';
+
+  BACKUP CURRENT CONTROLFILE FOR STANDBY
+    FORMAT '/backup/dg_seed/standby_control_%U.ctl';
+
+  RELEASE CHANNEL c1;
+  RELEASE CHANNEL c2;
+  RELEASE CHANNEL c3;
+  RELEASE CHANNEL c4;
+}
+```
+
+Choose `SECTION SIZE` and channel count based on actual I/O and storage capacity;
+do not assume that four channels or 16 GB sections are optimal for every system.
+
+**3. Validate the backup before moving it**
+
+Run RMAN validation and confirm the backup pieces are usable:
+
+```rman
+CROSSCHECK BACKUP;
+RESTORE DATABASE VALIDATE;
+```
+
+**4. Copy/stage the backup files**
+
+Move the backup pieces to the standby or an accessible backup repository. For large
+files, use a restartable transfer method appropriate for the environment (for example,
+parallel file transfer, enterprise backup infrastructure, or object storage).
+
+Do not require a single uninterrupted 4 TB network stream from DB01 to DB02.
+
+**5. Prepare the standby Oracle environment**
+
+Configure the Oracle Home, database directories, permissions, password file, Oracle
+Net connectivity, standby redo logs, and standby initialization parameters.
+
+**6. Catalog the copied backups on the standby**
+
+For backup pieces staged locally on DB02:
+
+```rman
+CATALOG START WITH '/backup/dg_seed/' NOPROMPT;
+```
+
+Verify that RMAN sees the expected backup sets.
+
+**7. Create the physical standby from the backup location**
+
+Use backup-based RMAN duplication rather than `FROM ACTIVE DATABASE`:
+
+```rman
+DUPLICATE TARGET DATABASE
+FOR STANDBY
+BACKUP LOCATION '/backup/dg_seed'
+DORECOVER
+SPFILE
+SET db_unique_name='ORCLCDG_STB'
+SET fal_server='ORCLCDG'
+NOFILENAMECHECK;
+```
+
+Adjust file-name conversion or `SET NEWNAME`/`DB_FILE_NAME_CONVERT` strategy to the
+actual storage layout. `NOFILENAMECHECK` is appropriate only when the source and
+auxiliary databases use separate hosts and the resulting file placement is known to
+be safe.
+
+**8. Catch up the standby with archived redo**
+
+If the primary continued generating redo while the backup was being transferred,
+ship the subsequent archived redo to the standby and apply it. For a long-running
+seed, an additional incremental roll-forward can be used to reduce the final redo
+catch-up window.
+
+**9. Start managed recovery**
+
+```sql
+ALTER DATABASE RECOVER MANAGED STANDBY DATABASE
+DISCONNECT FROM SESSION;
+```
+
+**10. Validate synchronization**
+
+Confirm the standby role, MRP/RFS processes, archive destination status, archive gap,
+transport lag, apply lag, and primary/standby sequence progression.
+
+```sql
+SELECT name,
+       db_unique_name,
+       database_role,
+       open_mode
+FROM v$database;
+
+SELECT process,
+       status,
+       thread#,
+       sequence#
+FROM v$managed_standby
+ORDER BY process;
+
+SELECT *
+FROM v$archive_gap;
+
+SELECT name, value, unit
+FROM v$dataguard_stats
+WHERE name IN ('transport lag', 'apply lag', 'apply finish time');
+```
+
+## Large Database Operational Notes
+
+- Keep the standby storage and backup repository sized for the full database plus redo
+  growth and operational headroom.
+- Use incremental backups when the standby falls significantly behind and re-copying
+  the entire 4 TB database is not operationally acceptable.
+- Pre-stage backup files before the final cutover window whenever possible.
+- Measure backup/transfer/restore throughput rather than estimating the recovery window
+  from database size alone.
+- Protect backup files with the same access controls and encryption requirements used
+  for production backups.
+- Keep the primary and standby on compatible Oracle software and patch levels.
+
 ## Start Redo Apply
 
 On DB02:
 
-``` sql
+```sql
 ALTER DATABASE RECOVER MANAGED STANDBY DATABASE
 DISCONNECT FROM SESSION;
 ```
 
 ## Validation
 
-``` sql
+```sql
 SELECT name,
        db_unique_name,
        database_role,
@@ -401,13 +588,13 @@ FROM v$database;
 
 Expected on DB02:
 
-``` text
+```text
 DATABASE_ROLE
 -------------
 PHYSICAL STANDBY
 ```
 
-------------------------------------------------------------------------
+---
 
 # Phase 8 — Redo Transport & Apply Validation
 
@@ -490,16 +677,15 @@ and after role transitions.
 
 ------------------------------------------------------------------------
 
-# Phase 11 — Planned Switchover & Snapshot Standby
+# Phase 10 — Planned Switchover & Snapshot Standby
 
 ## Objective
 
-Practice planned role transitions and understand Snapshot Standby
-behavior.
+Practice planned role transitions and understand Snapshot Standby behavior.
 
 ### Planned Switchover
 
-``` text
+```text
 Before:
 
 DB01 PRIMARY
@@ -507,7 +693,6 @@ DB01 PRIMARY
      │ Redo
      ▼
 DB02 STANDBY
-
 
 After:
 
@@ -518,20 +703,20 @@ DB01 STANDBY
 DB02 PRIMARY
 ```
 
-Before switchover:
+Before the switchover:
 
-``` text
-[ ] Broker/configuration healthy
+```text
 [ ] Redo transport healthy
 [ ] Redo apply healthy
 [ ] No archive gap
 [ ] Standby synchronized
 [ ] Client connectivity validated
+[ ] Role-transition procedure reviewed
 ```
 
-After switchover:
+After the switchover:
 
-``` text
+```text
 [ ] Former standby is PRIMARY
 [ ] Former primary is STANDBY
 [ ] Redo transport reversed
@@ -539,12 +724,12 @@ After switchover:
 [ ] Client connections validated
 ```
 
-Snapshot Standby testing, if supported by the environment, will be
-documented separately from the destructive failover exercise.
+Snapshot Standby testing, if supported by the environment, will be documented
+separately from the destructive failover exercise.
 
 ------------------------------------------------------------------------
 
-# Phase 12 — Disaster Failover & Active Data Guard
+# Phase 11 — Disaster Failover & Active Data Guard
 
 ## Objective
 
@@ -552,7 +737,7 @@ Perform the project's primary disaster-recovery test.
 
 ### Replication Test
 
-``` sql
+```sql
 CREATE TABLE DG_FAILOVER_TEST (
     id         NUMBER PRIMARY KEY,
     created_at TIMESTAMP,
@@ -560,7 +745,7 @@ CREATE TABLE DG_FAILOVER_TEST (
 );
 ```
 
-``` sql
+```sql
 INSERT INTO DG_FAILOVER_TEST
 VALUES (
     1,
@@ -573,38 +758,28 @@ COMMIT;
 
 Generate redo:
 
-``` sql
+```sql
 ALTER SYSTEM SWITCH LOGFILE;
 ```
 
-Verify the transaction on the standby.
+Verify the transaction on the standby before the failure simulation.
 
 ### Primary Failure Simulation
 
-For the controlled lab exercise:
+For the controlled DR exercise:
 
-``` sql
+```sql
 SHUTDOWN ABORT;
+```
 
 ### Failover
 
-``` text
-dgmgrl sys/<SYS_PASSWORD>@ORCLSTBY
-```
-
-Then:
-
-``` text
-SHOW CONFIGURATION;
-
-FAILOVER TO ORCLSTBY;
-```
-
-The physical standby becomes the new primary.
+Promote the synchronized physical standby to the new primary using the approved
+role-transition procedure for the environment.
 
 ### Verify New Primary
 
-``` sql
+```sql
 SELECT name,
        db_unique_name,
        database_role,
@@ -614,205 +789,94 @@ FROM v$database;
 
 Expected:
 
-``` text
+```text
 DATABASE_ROLE
 -------------
 PRIMARY
 ```
 
-Verify:
+Verify the test data:
 
-``` sql
+```sql
 SELECT *
 FROM DG_FAILOVER_TEST;
 ```
 
 ------------------------------------------------------------------------
 
-# Phase 11 — Planned Switchover & Snapshot Standby
+# Phase 12 — Reinstate / Rebuild Former Primary
 
 ## Objective
 
-Practice planned role transitions and understand Snapshot Standby
-behavior.
+Recover the former primary and return the environment to a healthy Data Guard
+configuration.
 
-### Planned Switchover
+The former primary should not simply be restarted and returned to service after
+failover. Where supported by the final Broker configuration and database state, use
+reinstate. Otherwise rebuild the former primary as a physical standby using RMAN.
 
-``` text
-Before:
-
-DB01 PRIMARY
-     │
-     │ Redo
-     ▼
-DB02 STANDBY
-
-
-After:
-
-DB01 STANDBY
-     ▲
-     │ Redo
-     │
-DB02 PRIMARY
-```
-
-Before switchover:
-
-``` text
-[ ] Broker/configuration healthy
-[ ] Redo transport healthy
-[ ] Redo apply healthy
-[ ] No archive gap
-[ ] Standby synchronized
-[ ] Client connectivity validated
-```
-
-After switchover:
-
-``` text
-[ ] Former standby is PRIMARY
-[ ] Former primary is STANDBY
-[ ] Redo transport reversed
-[ ] Redo apply working
-[ ] Client connections validated
-```
-
-Snapshot Standby testing, if supported by the environment, will be
-documented separately from the destructive failover exercise.
-
-------------------------------------------------------------------------
-
-# Phase 12 — Disaster Failover & Active Data Guard
-
-## Objective
-
-Perform the project's primary disaster-recovery test.
-
-### Replication Test
-
-``` sql
-CREATE TABLE DG_FAILOVER_TEST (
-    id         NUMBER PRIMARY KEY,
-    created_at TIMESTAMP,
-    note       VARCHAR2(200)
-);
-```
-
-``` sql
-INSERT INTO DG_FAILOVER_TEST
-VALUES (
-    1,
-    SYSTIMESTAMP,
-    'Created on original primary'
-);
-
-COMMIT;
-```
-
-Generate redo:
-
-``` sql
-ALTER SYSTEM SWITCH LOGFILE;
-```
-
-Verify the transaction on the standby.
-
-### Primary Failure Simulation
-
-For the controlled lab exercise:
-
-``` sql
-SHUTDOWN ABORT;
-
-### Failover
-
-``` text
-dgmgrl sys/<SYS_PASSWORD>@ORCLSTBY
-```
-
-Then:
-
-``` text
-SHOW CONFIGURATION;
-
-FAILOVER TO ORCLSTBY;
-```
-
-The physical standby becomes the new primary.
-
-### Verify New Primary
-
-``` sql
-SELECT name,
-       db_unique_name,
-       database_role,
-       open_mode
-FROM v$database;
-```
-
-Expected:
-
-``` text
-DATABASE_ROLE
--------------
-PRIMARY
-```
-
-Verify:
-
-``` sql
-SELECT *
-FROM DG_FAILOVER_TEST;
+```text
+FAILOVER
+   ↓
+NEW PRIMARY
+   ↓
+REINSTATE OR REBUILD FORMER PRIMARY
+   ↓
+REDO APPLY
+   ↓
+SYNCHRONIZED STANDBY
 ```
 
 ------------------------------------------------------------------------
 
-# Phase 10 — Data Guard Broker & DR Operations
+# Phase 13 — Data Guard Broker & DR Operations
 
 ## Objective
 
-Use Data Guard Broker to centrally manage and validate the Data Guard
-environment and complete the final DR exercise.
+Use Data Guard Broker to centrally manage and validate the Data Guard environment
+**after the manual switchover and failover exercises have been completed**.
 
 ## Enable Broker
 
 On both databases:
 
-``` sql
+```sql
 ALTER SYSTEM SET DG_BROKER_START=TRUE SCOPE=BOTH;
 ```
 
 ## Create Broker Configuration
 
-``` text
+Use the final role-aware service names and connect identifiers established during
+client/service validation. Example structure:
+
+```text
 CREATE CONFIGURATION ORCL_DG AS
-PRIMARY DATABASE IS ORCLPRI
-CONNECT IDENTIFIER IS ORCLPRI;
+PRIMARY DATABASE IS <PRIMARY_DB_UNIQUE_NAME>
+CONNECT IDENTIFIER IS <PRIMARY_CONNECT_IDENTIFIER>;
 ```
 
-Add standby:
+Add the standby:
 
-``` text
-ADD DATABASE ORCLSTBY AS
-CONNECT IDENTIFIER IS ORCLSTBY
+```text
+ADD DATABASE <STANDBY_DB_UNIQUE_NAME> AS
+CONNECT IDENTIFIER IS <STANDBY_CONNECT_IDENTIFIER>
 MAINTAINED AS PHYSICAL;
 ```
 
 Enable:
 
-``` text
+```text
 ENABLE CONFIGURATION;
 ```
 
 ## Broker Validation
 
-``` text
+```text
 SHOW CONFIGURATION;
 
-VALIDATE DATABASE ORCLPRI;
+VALIDATE DATABASE <PRIMARY_DB_UNIQUE_NAME>;
 
-VALIDATE DATABASE ORCLSTBY;
+VALIDATE DATABASE <STANDBY_DB_UNIQUE_NAME>;
 
 VALIDATE NETWORK CONFIGURATION FOR ALL;
 ```
@@ -846,7 +910,9 @@ VALIDATE NETWORK CONFIGURATION FOR ALL;
         ↓
 12. PLANNED SWITCHOVER
         ↓
-13. FINAL VALIDATION
+13. DATA GUARD BROKER
+        ↓
+14. FINAL VALIDATION
 ```
 
 ------------------------------------------------------------------------
@@ -937,7 +1003,7 @@ theoretical targets.
 # Repository Structure
 
 ``` text
-oracle-19c-data-guard-failover-lab/
+enterprise-oracle-data-guard-engineering/
 │
 ├── README.md
 ├── docs/
@@ -1007,8 +1073,9 @@ oracle-19c-data-guard-failover-lab/
 ## Physical Standby
 
 ``` text
-[ ] RMAN Active Duplicate completed
-[ ] DB02 recognized as physical standby
+[x] RMAN Active Duplicate completed for the current project
+[ ] Backup-based duplicate procedure documented for large databases
+[x] DB02 recognized as physical standby
 [ ] Managed recovery enabled
 [ ] Redo transport working
 [ ] Redo apply working
@@ -1018,6 +1085,7 @@ oracle-19c-data-guard-failover-lab/
 ## Broker
 
 ``` text
+[ ] Manual switchover/failover exercises completed
 [ ] DG_BROKER_START enabled
 [ ] Broker configuration created
 [ ] Primary added
@@ -1054,6 +1122,7 @@ oracle-19c-data-guard-failover-lab/
 -   ARCHIVELOG and FORCE LOGGING
 -   Oracle Net Services
 -   RMAN Active Database Duplication
+-   RMAN backup-based standby construction for large databases
 -   Data Guard Broker and DGMGRL
 -   Switchover and failover
 -   Reinstate/rebuild
@@ -1106,23 +1175,3 @@ not only **how to configure Data Guard**, but also **how to operate it
 when something goes wrong**.
 
 ------------------------------------------------------------------------
-
-# Documentation
-
-Detailed command-by-command procedures are maintained in:
-
-``` text
-docs/Oracle_19c_Data_Guard_Failover_Lab_Runbook.docx
-```
-
-The README provides the production-grade project roadmap. The runbook
-provides the detailed execution procedures.
-
-------------------------------------------------------------------------
-
-# Disclaimer
-
-Do not execute destructive failover commands against a production
-database without an approved disaster-recovery procedure, appropriate
-backups, change approval, defined RPO/RTO objectives, and a tested
-recovery plan.
